@@ -1,0 +1,194 @@
+name: mlops-hw3
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U airflow]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - kafka:/var/lib/kafka/data
+    healthcheck:
+      test: [CMD, /opt/kafka/bin/kafka-topics.sh, --bootstrap-server, localhost:9092, --list]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  kafka-setup:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 1 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic scores --partitions 1 --replication-factor 1
+
+  init:
+    image: mlops-hw3-airflow:local
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    user: '0:0'
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        mkdir -p /opt/project/shared /opt/airflow/logs
+        chown 50000:0 /opt/project/shared /opt/airflow/logs
+    volumes:
+      - shared:/opt/project/shared
+      - airflow-logs:/opt/airflow/logs
+
+  airflow-init:
+    image: mlops-hw3-airflow:local
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__CORE__PARALLELISM: '2'
+      AIRFLOW__WEBSERVER__SECRET_KEY: hw3-local-demo
+      AIRFLOW__WEBSERVER__WORKERS: '1'
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    command: [python, -m, pipeline.bootstrap]
+    volumes:
+      - shared:/opt/project/shared
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    image: mlops-hw3-airflow:local
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__CORE__PARALLELISM: '2'
+      AIRFLOW__WEBSERVER__SECRET_KEY: hw3-local-demo
+      AIRFLOW__WEBSERVER__WORKERS: '1'
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    command: webserver
+    ports:
+      - 127.0.0.1:8081:8080
+    volumes:
+      - shared:/opt/project/shared
+      - airflow-logs:/opt/airflow/logs
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8080/health]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  airflow-scheduler:
+    image: mlops-hw3-airflow:local
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__CORE__PARALLELISM: '2'
+      AIRFLOW__WEBSERVER__SECRET_KEY: hw3-local-demo
+      AIRFLOW__WEBSERVER__WORKERS: '1'
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    command: scheduler
+    volumes:
+      - shared:/opt/project/shared
+      - airflow-logs:/opt/airflow/logs
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8974/health]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  fraud_detector:
+    build:
+      context: .
+      dockerfile: fraud_detector/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FRAUD_THRESHOLD: '0.5'
+    volumes:
+      - shared:/opt/project/shared:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  transaction_simulator:
+    build:
+      context: .
+      dockerfile: transaction_simulator/Dockerfile
+    environment:
+      KAFKA_BROKERS: kafka:9092
+    volumes:
+      - shared:/opt/project/shared:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  shared:
+  postgres:
+  kafka:
+  airflow-logs:
